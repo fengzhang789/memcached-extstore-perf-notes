@@ -38,6 +38,10 @@ lspci | grep -i ethernet
 - **NIC Hardware:** Intel Corporation Ethernet Controller E810-XXV for SFP (rev 02) & Intel 10-Gigabit X540-AT2 (rev 01)
 - **Physical Upper Bound:** Network payload bandwidth is capped at **10 Gbps (~1.25 GB/s theoretical maximum)**.
 
+The NVMe SSD on husky10 was verified to be HWE36P43016M000N MLC (likely with no SLC buffer).
+
+- via `lsblk -d -o NAME,MODEL,SERIAL,SIZE`
+
 ---
 
 ## Server Setup (`husky10`)
@@ -247,14 +251,75 @@ With only 32 MB of DRAM and 10KB item sizes, all of the items should get offload
 
 ---
 
+## Experiment 3: Direct I/O (`O_DIRECT`) Storage-Bound Test
+
+To bypass kernel page cache, Memcached was modified to use `O_DIRECT` for for Extstore storage reads/writes (see memcached folder of this repository for changes). Linux file alignment for O_DIRECT require file offsets, lengths, and memory buffers to be aligned to filesystem block boundaries (4096 bytes).
+
+Memcached was built, compiled and tested via the commands in the README of [github.com/memcached/memcached](https://github.com/memcached/memcached)
+
+Server launch command:
+
+```
+./memcached -u yf4zhang \
+  -l <server IP> \
+  -p 11211 \
+  -m 32 \
+  -t 64 \
+  -c 16384 \
+  -o ext_path=/mnt/nvme_storage/extstore.data:20G,ext_item_size=8192,ext_threads=4,ext_wbuf_size=2 \
+  -d
+```
+
+Workload:
+`./mutilate -s <server IP>:11211 --records=1000000 --valuesize=10000 -T 12 -c 512 -t 60`
+
+Result:
+
+```
+type       avg     std     min     5th    10th    90th    95th    99th
+read     2015.3  3432.5    66.3   130.0   145.1  7817.4  8229.4  8590.3
+update      0.0     0.0     0.0     0.0     0.0     0.0     0.0     0.0
+op_q        1.0     0.0     1.0     1.0     1.0     1.1     1.1     1.1
+
+Total QPS = 101591.4 (6095490 / 60.0s)
+
+Misses = 4717926 (77.4%)
+Skipped TXs = 0 (0.0%)
+
+RX 13929463417 bytes :  221.4 MB/s
+TX  219658392 bytes :    3.5 MB/s
+```
+
+### Analysis:
+
+In the first 40 seconds, the results were network bound, with usage of SSD this time:
+
+- Network (`sar -n DEV 1`): rxkB/s = 1,190,063.95 (~1.19 GB/s), %ifutil = 97.49%
+
+- Disk (`iostat -xz 1`): Writes = 2,960 w/s (~378.8 MB/s), %util = 13.0% - 14.2%
+
+However, in the last ~20 seconds of the benchmark, results seemed to be completely storage bound
+
+- Network (`sar -n DEV 1`): Transmit payload drops to txkB/s = 243,117.35 (~243 MB/s), %ifutil = 19.92%
+
+- Disk (`iostat -xz 1`): Direct reads reach 22,936 r/s (~317.2 MB/s), driving %util to 99.9% – 100.0%
+
+We can see from these results that overall throughput decrease to 221 MB/s, which makes sense since we are bypassing the kernel cache. We are also definitely using more SSD than experiment 2, verifying that the O_DIRECT flag has worked. I suspect the reason why storage jumps so high in the last few seconds may be of two reasons:
+
+1. Extstore page compaction activates later on to reclaim fragmented page, adding internal read/write overhead on the SSD, shooting its usage up to 100%
+
+2. Our SSD has a SLC buffer (SLC is faster than MLC) that makes initial reads/writes super fast (this is unlikely with our type of SSD, since our SSD is enterprise).
+
 ## Summary of Learnings
 
-1. There is a clear shift between network to storage bottleneck between the two experiments due to the item size change.
+1. There is a clear shift between network to storage bottleneck between the experiments due to the item size change.
 
 2. The linux page cache can cause issues while benchmarking storage bound workloads, we need a way to get around the page cache (`O_DIRECT`)
+
+3. Page compaction might be driving up SSD usage later onto the benchmark more than the actual workload.
 
 ---
 
 ## Future Work
 
-Future work requires another experiment and modification to the memcached source code (`extstore`) to pass `O_DIRECT` or some other flag to its write syscalls in order to bypass the linux cache. That way we can clearly see the storage bottleneck.
+Future work requires more analysis into the exact reason why we get the results we do in experiment 3.
