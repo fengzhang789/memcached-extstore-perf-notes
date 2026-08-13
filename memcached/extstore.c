@@ -132,7 +132,7 @@ static _store_wbuf *wbuf_new(size_t size) {
         return NULL;
     // for O_DIRECT, we need b->buf to be aligned to 4096 block size
     if (posix_memalign((void **)&b->buf, EXTSTORE_DIO_ALIGN, size) != 0) {
-        free(b)
+        free(b);
         return NULL;
     }
     memset(b->buf, 0, size);
