@@ -902,24 +902,9 @@ static void *extstore_io_thread(void *arg) {
                     }
                     pthread_mutex_unlock(&p->mutex);
                     if (do_op) {
-#if !defined(HAVE_PREAD) || !defined(HAVE_PREADV)
-                        // TODO: lseek offset is natively 64-bit on OS X, but
-                        // perhaps not on all platforms? Else use lseek64()
-                        ret = lseek(p->fd, p->offset + cur_io->offset, SEEK_SET);
-                        if (ret >= 0) {
-                            if (cur_io->iov == NULL) {
-                                ret = read(p->fd, cur_io->buf, cur_io->len);
-                            } else {
-                                ret = readv(p->fd, cur_io->iov, cur_io->iovcnt);
-                            }
-                        }
-#else
-                        if (cur_io->iov == NULL) {
-                            ret = pread(p->fd, cur_io->buf, cur_io->len, p->offset + cur_io->offset);
-                        } else {
-                            ret = preadv(p->fd, cur_io->iov, cur_io->iovcnt, p->offset + cur_io->offset);
-                        }
-#endif
+                        // new: O_DIRECT reads, since individual item reads are not block aligned,
+                        // bounce through scratch buffer h
+                        ret = _direct_pread(p, cur_io);
                     }
                     break;
                 case OBJ_IO_WRITE:
@@ -993,4 +978,44 @@ static void _free_page(store_engine *e, store_page *p) {
     e->page_free++;
     E_DEBUG("EXTSTORE: pages free %u\n", e->page_free);
     pthread_mutex_unlock(&e->mutex);
+}
+
+/* O_DIRECT reads: item reads come in at arbitrary offset/length (whatever
+ * the item's size happens to be), which won't generally satisfy the
+ * alignment requirement. We read a block-aligned superset into a scratch
+ * buffer and copy out just the bytes the caller wanted.
+ * Returns the number of caller-visible bytes read on success, or a
+ * negative value on error - mirrors the pread()/preadv() convention used
+ * by the rest of this function.
+ */
+static ssize_t _direct_pread(store_page *p, obj_io *io) {
+    const size_t align = EXTSTORE_DIO_ALIGN;
+    off_t raw_off = p->offset + io->offset;
+    off_t aligned_off = raw_off & ~(off_t)(align - 1);
+    size_t front_pad = (size_t)(raw_off - aligned_off);
+    size_t aligned_len = ((front_pad + io->len + align - 1) / align) * align;
+
+    void *bounce = NULL;
+    if (posix_memalign(&bounce, align, aligned_len) != 0) {
+        return -1;
+    }
+
+    ssize_t rret = pread(p->fd, bounce, aligned_len, aligned_off);
+    ssize_t ret = -1;
+    if (rret >= 0 && (size_t)rret >= front_pad + io->len) {
+        if (io->iov == NULL) {
+            memcpy(io->buf, (char *)bounce + front_pad, io->len);
+        } else {
+            unsigned int off = front_pad;
+            for (int x = 0; x < io->iovcnt; x++) {
+                struct iovec *iov = &io->iov[x];
+                memcpy(iov->iov_base, (char *)bounce + off, iov->iov_len);
+                off += iov->iov_len;
+            }
+        }
+        ret = io->len;
+    }
+
+    free(bounce);
+    return ret;
 }
