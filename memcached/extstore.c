@@ -834,6 +834,46 @@ static inline int _read_from_wbuf(store_page *p, obj_io *io) {
     return io->len;
 }
 
+/* O_DIRECT reads: item reads come in at arbitrary offset/length (whatever
+ * the item's size happens to be), which won't generally satisfy the
+ * alignment requirement. We read a block-aligned superset into a scratch
+ * buffer and copy out just the bytes the caller wanted.
+ * Returns the number of caller-visible bytes read on success, or a
+ * negative value on error - mirrors the pread()/preadv() convention used
+ * by the rest of this function.
+ */
+static ssize_t _direct_pread(store_page *p, obj_io *io) {
+    const size_t align = EXTSTORE_DIO_ALIGN;
+    off_t raw_off = p->offset + io->offset;
+    off_t aligned_off = raw_off & ~(off_t)(align - 1);
+    size_t front_pad = (size_t)(raw_off - aligned_off);
+    size_t aligned_len = ((front_pad + io->len + align - 1) / align) * align;
+
+    void *bounce = NULL;
+    if (posix_memalign(&bounce, align, aligned_len) != 0) {
+        return -1;
+    }
+
+    ssize_t rret = pread(p->fd, bounce, aligned_len, aligned_off);
+    ssize_t ret = -1;
+    if (rret >= 0 && (size_t)rret >= front_pad + io->len) {
+        if (io->iov == NULL) {
+            memcpy(io->buf, (char *)bounce + front_pad, io->len);
+        } else {
+            unsigned int off = front_pad;
+            for (int x = 0; x < io->iovcnt; x++) {
+                struct iovec *iov = &io->iov[x];
+                memcpy(iov->iov_base, (char *)bounce + off, iov->iov_len);
+                off += iov->iov_len;
+            }
+        }
+        ret = io->len;
+    }
+
+    free(bounce);
+    return ret;
+}
+
 /* engine IO thread; takes engine context
  * manage writes/reads
  * runs IO callbacks inline after each IO
@@ -980,42 +1020,3 @@ static void _free_page(store_engine *e, store_page *p) {
     pthread_mutex_unlock(&e->mutex);
 }
 
-/* O_DIRECT reads: item reads come in at arbitrary offset/length (whatever
- * the item's size happens to be), which won't generally satisfy the
- * alignment requirement. We read a block-aligned superset into a scratch
- * buffer and copy out just the bytes the caller wanted.
- * Returns the number of caller-visible bytes read on success, or a
- * negative value on error - mirrors the pread()/preadv() convention used
- * by the rest of this function.
- */
-static ssize_t _direct_pread(store_page *p, obj_io *io) {
-    const size_t align = EXTSTORE_DIO_ALIGN;
-    off_t raw_off = p->offset + io->offset;
-    off_t aligned_off = raw_off & ~(off_t)(align - 1);
-    size_t front_pad = (size_t)(raw_off - aligned_off);
-    size_t aligned_len = ((front_pad + io->len + align - 1) / align) * align;
-
-    void *bounce = NULL;
-    if (posix_memalign(&bounce, align, aligned_len) != 0) {
-        return -1;
-    }
-
-    ssize_t rret = pread(p->fd, bounce, aligned_len, aligned_off);
-    ssize_t ret = -1;
-    if (rret >= 0 && (size_t)rret >= front_pad + io->len) {
-        if (io->iov == NULL) {
-            memcpy(io->buf, (char *)bounce + front_pad, io->len);
-        } else {
-            unsigned int off = front_pad;
-            for (int x = 0; x < io->iovcnt; x++) {
-                struct iovec *iov = &io->iov[x];
-                memcpy(iov->iov_base, (char *)bounce + off, iov->iov_len);
-                off += iov->iov_len;
-            }
-        }
-        ret = io->len;
-    }
-
-    free(bounce);
-    return ret;
-}
