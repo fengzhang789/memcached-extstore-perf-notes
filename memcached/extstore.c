@@ -42,6 +42,8 @@
     pthread_mutex_unlock(&e->stats_mutex); \
 }
 
+#define EXTSTORE_DIO_ALIGN 4096
+
 typedef struct __store_wbuf {
     struct __store_wbuf *next;
     char *buf;
@@ -128,11 +130,12 @@ static _store_wbuf *wbuf_new(size_t size) {
     _store_wbuf *b = calloc(1, sizeof(_store_wbuf));
     if (b == NULL)
         return NULL;
-    b->buf = calloc(size, sizeof(char));
-    if (b->buf == NULL) {
-        free(b);
+    // for O_DIRECT, we need b->buf to be aligned to 4096 block size
+    if (posix_memalign((void **)&b->buf, EXTSTORE_DIO_ALIGN, size) != 0) {
+        free(b)
         return NULL;
     }
+    memset(b->buf, 0, size);
     b->buf_pos = b->buf;
     b->free = size;
     b->size = size;
@@ -290,7 +293,7 @@ void *extstore_init(struct extstore_conf_file *fh, struct extstore_conf *cf,
     e->page_size = cf->page_size;
     uint64_t temp_page_count = 0;
     for (f = fh; f != NULL; f = f->next) {
-        f->fd = open(f->file, O_RDWR | O_CREAT, 0644);
+        f->fd = open(f->file, O_DIRECT | O_RDWR | O_CREAT, 0644);
         if (f->fd < 0) {
             *res = EXTSTORE_INIT_OPEN_FAIL;
 #ifdef EXTSTORE_DEBUG
