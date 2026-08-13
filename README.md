@@ -12,7 +12,7 @@
 
 ## Overview & Architecture
 
-This repository documents the bottleneck analysis and key learnings from benchmarking Memcached with Extstore. Also serves as
+This repository documents the bottleneck analysis and key learnings from benchmarking Memcached with Extstore as part of my URA with Prof. Martin Karsten. Future work to be done is also outlined at the bottom.
 
 ---
 
